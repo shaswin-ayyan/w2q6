@@ -4,9 +4,10 @@ from pydantic import BaseModel
 import pandas as pd
 import io
 
-# Data from q-vercel-latency.json embedded as a string
-# This is required because Vercel serverless functions cannot reliably read
-# local files (like a separate JSON file) during runtime.
+# ----------------------------------------------------------------------
+# 1. Embedded Telemetry Data in the required Array of Objects format
+#    - Includes region, latency_ms, and uptime_percentage.
+# ----------------------------------------------------------------------
 TELEMETRY_JSON_DATA = """
 [
   {
@@ -264,44 +265,56 @@ TELEMETRY_JSON_DATA = """
 ]
 """
 
+# Initialize FastAPI App
 app = FastAPI()
 
-# Enable CORS for POST requests from any origin
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["POST"],
-    allow_headers=["*"],
-)
-
-# Define the input model for the POST request body
+# Input model validation
 class LatencyQuery(BaseModel):
     regions: list[str]
     threshold_ms: int
 
-# Load data into a pandas DataFrame once at startup
+# --- CORS Configuration ---
+# Enables CORS for POST requests from any origin (*)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["POST", "OPTIONS"],  # POST is required, OPTIONS for pre-flight
+    allow_headers=["*"],
+)
+
+# Load data into a pandas DataFrame once at the module level
 df = pd.read_json(io.StringIO(TELEMETRY_JSON_DATA))
 
+# ----------------------------------------------------------------------
+# 2. POST Endpoint: /analytics
+# ----------------------------------------------------------------------
 @app.post("/analytics")
 def get_analytics(query: LatencyQuery):
-    """
-    Accepts regions and a latency threshold, and returns mean latency,
-    P95 latency, mean uptime, and breach count for the specified regions.
-    """
+    """Calculates per-region latency and uptime metrics."""
     
-    # Filter data for the requested regions
-    filtered_df = df[df['region'].isin(query.regions)]
+    # Filter for requested regions
+    filtered_df = df[df['region'].isin(query.regions)].copy()
     
+    # Define custom aggregation functions that capture the threshold
+    def breaches_count(x):
+        """Count records strictly above the threshold."""
+        return (x > query.threshold_ms).sum()
+
+    def p95_calc(x):
+        """Calculate the 95th percentile."""
+        # Pandas uses 'linear' interpolation, which is standard for p95.
+        return x.quantile(0.95)
+
     # Group by region and calculate all required metrics
     metrics = filtered_df.groupby('region').agg(
         avg_latency=('latency_ms', 'mean'),
-        p95_latency=('latency_ms', lambda x: x.quantile(0.95)),
+        p95_latency=('latency_ms', p95_calc),
         avg_uptime=('uptime_percentage', 'mean'),
-        breaches=('latency_ms', lambda x: (x > query.threshold_ms).sum())
+        breaches=('latency_ms', breaches_count)
     )
     
-    # Format the results into a list of dictionaries with required precision
+    # Format, round, and return the results as a list of dictionaries
     results = []
     for region, row in metrics.iterrows():
         results.append({
@@ -313,8 +326,8 @@ def get_analytics(query: LatencyQuery):
         })
         
     return results
-
+    
+# Root endpoint for Vercel health check
 @app.get("/")
 def read_root():
-    # Simple root path for Vercel health check
-    return {"message": "Analytics Service is Running"}
+    return {"status": "ok"}
